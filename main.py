@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI, HTTPException, status, Request, WebSocket
 from datetime import datetime, timezone
 import os
@@ -12,6 +14,7 @@ import logging
 
 from data import BinanceClient, SYMBOLS_CACHE, TICKER_CACHE
 from models import predictor
+
 
 ALLOWED_INTERVALS = ["1h", "4h", "1d", "1w"]
 INTERVAL_HOURS = {"1h": 1, "4h": 4, "1d": 24, "1w": 168}
@@ -111,21 +114,31 @@ async def websocket_realtime(websocket: WebSocket, symbol: str):
         logger.error(f"WebSocket error ({symbol}): {str(e)}")
         await websocket.close(code=1011)
 
+# main.py (updated endpoint)
 @app.get("/predict/{symbol}", tags=["Predictions"])
 @limiter.limit("30/minute")
 async def predict_price(request: Request, symbol: str, interval: str = "1h"):
     try:
         ohlcv = binance.fetch_ohlcv(symbol, interval, limit=100)
         closes = [entry["close"] for entry in ohlcv]
-        return {
-            "symbol": symbol,
-            "interval": interval,
-            "current_price": closes[-1],
-            **predictor.predict(closes, interval)
-        }
+        
+        if len(closes) < 50:
+            raise HTTPException(
+                status_code=422,
+                detail="Need at least 50 data points for analysis"
+            )
+            
+        analysis = predictor.analyze_market(closes, interval)
+        analysis["metadata"]["symbol"] = symbol
+        
+        return analysis
+        
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Prediction failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Analysis failed: " + str(e)
+        )
 
 if __name__ == "__main__":
     uvicorn.run(

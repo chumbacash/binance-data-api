@@ -1,42 +1,225 @@
+# models.py
 import numpy as np
-from sklearn.linear_model import LinearRegression
+from fastapi import HTTPException 
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Dict
+import logging
+from services.gemini_insights import GeminiInsightsGenerator
+
+logger = logging.getLogger("CryptoPredictAPI")
+
+class TechnicalAnalyzer:
+    def __init__(self, prices: List[float]):
+        self.prices = prices
+        
+    def calculate_volatility(self, window: int = 24) -> float:
+        """Calculate price volatility as standard deviation"""
+        returns = np.diff(self.prices[-window:]) / self.prices[-window:-1]
+        return float(np.std(returns))
+
+    def find_key_levels(self) -> Dict:
+        """Identify support/resistance using recent price extremes"""
+        lookback = min(100, len(self.prices))
+        recent_highs = [h for h in self.prices[-lookback:] if h >= np.percentile(self.prices[-lookback:], 70)]
+        recent_lows = [l for l in self.prices[-lookback:] if l <= np.percentile(self.prices[-lookback:], 30)]
+        
+        return {
+            "support": float(np.mean(recent_lows)) if recent_lows else None,
+            "resistance": float(np.mean(recent_highs)) if recent_highs else None
+        }
+
+    def generate_messages(self, indicators: Dict) -> Dict:
+        """Create human-readable insights from technical data"""
+        messages = {
+            "summary": "",
+            "key_insights": [],
+            "action_guide": {}
+        }
+
+        # Trend analysis
+        if indicators['sma_20'] > indicators['sma_50']:
+            messages['key_insights'].append("Bullish SMA crossover (20 > 50)")
+        else:
+            messages['key_insights'].append("Bearish SMA crossover (20 < 50)")
+
+        # RSI analysis
+        if indicators['rsi'] > 70:
+            messages['key_insights'].append("Overbought (RSI > 70)")
+        elif indicators['rsi'] < 30:
+            messages['key_insights'].append("Oversold (RSI < 30)")
+
+        # MACD analysis
+        if indicators['macd']['histogram'] > 0:
+            messages['key_insights'].append("Bullish MACD momentum")
+        else:
+            messages['key_insights'].append("Bearish MACD momentum")
+
+        # Generate summary
+        bull_count = sum(1 for insight in messages['key_insights'] if "Bullish" in insight)
+        bear_count = sum(1 for insight in messages['key_insights'] if "Bearish" in insight)
+        
+        if bull_count > bear_count:
+            messages['summary'] = "Bullish Bias Detected"
+            messages['action_guide'] = {"buy": 0.7, "sell": 0.3, "hold": 0.5}
+        elif bear_count > bull_count:
+            messages['summary'] = "Bearish Bias Detected"
+            messages['action_guide'] = {"buy": 0.3, "sell": 0.7, "hold": 0.4}
+        else:
+            messages['summary'] = "Neutral Market Conditions"
+            messages['action_guide'] = {"buy": 0.5, "sell": 0.5, "hold": 0.6}
+
+        return messages
 
 class AdvancedPredictor:
     def __init__(self):
-        self.models = {
-            "linear": LinearRegression(),
-            "moving_avg": self._create_moving_avg_model()
+        self.gemini = GeminiInsightsGenerator()
+        self.prices = []
+        self.indicators = {
+            "sma_20": None,
+            "sma_50": None,
+            "rsi": None,
+            "macd": {}
         }
         
-    def _create_moving_avg_model(self):
-        class MovingAverage:
-            def predict(self, prices, window=3):
-                return np.convolve(prices, np.ones(window)/window, mode='valid')[-1]
-        return MovingAverage()
-    
-    def _calculate_confidence(self, prices):
-        volatility = np.std(prices[-24:]) / np.mean(prices[-24:])
-        trend_strength = np.polyfit(range(len(prices)), prices, 1)[0]
-        return max(0.4, min(0.95, 1 - volatility + abs(trend_strength*100)))
+    def _calculate_sma(self, window: int) -> float:
+        return float(np.mean(self.prices[-window:]))
 
-    def predict(self, prices: List[float], interval: str) -> dict:
-        if len(prices) < 48:
-            raise ValueError("Insufficient historical data")
+    def _calculate_rsi(self, window: int = 14) -> float:
+        deltas = np.diff(self.prices)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains[-window:])
+        avg_loss = np.mean(losses[-window:])
+        
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return float(100 - (100 / (1 + rs)))
+
+    def _calculate_ema(self, window: int, prices: np.ndarray = None) -> np.ndarray:
+        prices = np.array(prices) if prices is not None else np.array(self.prices)
+        if len(prices) < window:
+            return np.array([])
+        weights = np.exp(np.linspace(-1., 0., window))
+        weights /= weights.sum()
+        return np.convolve(prices, weights, mode='valid')
+
+    def _calculate_macd(self) -> Dict:
+        # Calculate EMAs as numpy arrays
+        ema12 = self._calculate_ema(12)
+        ema26 = self._calculate_ema(26)
+        
+        # Handle insufficient data
+        if len(ema12) == 0 or len(ema26) == 0:
+            return {"macd": 0.0, "signal": 0.0, "histogram": 0.0}
+        
+        # Align lengths
+        min_len = min(len(ema12), len(ema26))
+        ema12 = ema12[-min_len:]
+        ema26 = ema26[-min_len:]
+        
+        # Calculate MACD line
+        macd_line = ema12 - ema26
+        
+        # Calculate signal line
+        if len(macd_line) >= 9:
+            signal_line = self._calculate_ema(9, macd_line)
+            signal = signal_line[-1] if len(signal_line) > 0 else 0.0
+        else:
+            signal = 0.0
             
-        X = np.arange(len(prices)).reshape(-1, 1)
-        y = np.array(prices)
-        
-        self.models["linear"].fit(X, y)
-        lr_pred = self.models["linear"].predict([[len(X)]])[0]
-        ma_pred = self.models["moving_avg"].predict(y)
-        
         return {
-            "prediction": round(float((lr_pred * 0.6) + (ma_pred * 0.4)), 4),
-            "confidence": round(float(self._calculate_confidence(prices)), 4),
-            "interval": interval,
-            "last_updated": datetime.now(timezone.utc).isoformat()
+            "macd": float(macd_line[-1]),
+            "signal": float(signal),
+            "histogram": float(macd_line[-1] - signal)
         }
+
+    def analyze_market(self, prices: List[float], interval: str) -> Dict:
+        self.prices = prices
+        analyzer = TechnicalAnalyzer(prices)
+        
+        try:
+            # First calculate all indicators
+            self.indicators = {
+                "sma_20": self._calculate_sma(20),
+                "sma_50": self._calculate_sma(50),
+                "rsi": self._calculate_rsi(),
+                "macd": self._calculate_macd(),
+                "volatility": analyzer.calculate_volatility(),
+                "key_levels": analyzer.find_key_levels()
+            }
+
+            # Generate basic messages
+            messages = analyzer.generate_messages(self.indicators)
+            
+            # Then get Gemini analysis
+            try:
+                gemini_analysis = self.gemini.generate_analysis({
+                    "current_price": prices[-1],
+                    "sma_20": self.indicators['sma_20'],
+                    "sma_50": self.indicators['sma_50'],
+                    "rsi": self.indicators['rsi'],
+                    "macd": self.indicators['macd'],
+                    "volatility": self.indicators['volatility'],
+                    "key_levels": self.indicators['key_levels']
+                })
+            except Exception as e:
+                gemini_analysis = {"error": "AI analysis unavailable"}
+
+            return {
+                "metadata": {
+                    "symbol": "BTCUSDT",
+                    "interval": interval,
+                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "data_quality": min(0.99, len(prices)/100)
+                },
+                "price_analysis": {
+                    "current": prices[-1],
+                    "prediction": self._generate_prediction(),
+                    "confidence": self._calculate_confidence(),
+                    **self.indicators
+                },
+                "frontend_insights": messages,
+                "ai_insights": gemini_analysis
+            }
+            
+        except Exception as e:
+            logger.error(f"Analysis error: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail="Analysis failed: " + str(e)
+            )
+
+    def _generate_prediction(self) -> float:
+        """Combine indicators for price prediction"""
+        base_price = self.indicators['sma_20']
+        
+        # MACD influence
+        if self.indicators['macd']['histogram'] > 0:
+            base_price *= 1.005
+        else:
+            base_price *= 0.995
+            
+        # RSI influence
+        if self.indicators['rsi'] > 70:
+            base_price *= 0.99
+        elif self.indicators['rsi'] < 30:
+            base_price *= 1.01
+            
+        return round(float(base_price), 2)
+
+    def _calculate_confidence(self) -> float:
+        """Calculate confidence score 0-1"""
+        confidence = 0.5
+        # Volatility impact
+        confidence -= self.indicators['volatility'] * 0.5
+        # SMA crossover confirmation
+        if self.indicators['sma_20'] > self.indicators['sma_50']:
+            confidence += 0.2
+        # RSI confirmation
+        if 30 < self.indicators['rsi'] < 70:
+            confidence += 0.1
+        return max(0.3, min(0.99, confidence))
 
 predictor = AdvancedPredictor()
