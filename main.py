@@ -114,7 +114,46 @@ async def websocket_realtime(websocket: WebSocket, symbol: str):
         logger.error(f"WebSocket error ({symbol}): {str(e)}")
         await websocket.close(code=1011)
 
-# main.py (updated endpoint)
+
+
+@app.get("/intraday/{symbol}", tags=["Market Data"])
+@limiter.limit("30/minute")
+async def get_intraday_data(request: Request, symbol: str):
+    """
+    Returns intraday data for the given symbol based on 1-hour candles for the current day.
+    Data points are fetched from midnight (UTC) until the current time.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        # Determine the start of the current day in UTC
+        start_of_day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        # Calculate how many full hours have elapsed since the start of the day (plus one to include the current hour)
+        hours_elapsed = int((now - start_of_day).total_seconds() // 3600) + 1
+
+        # Fetch hourly OHLCV data for the symbol with limit = hours_elapsed
+        hourly_data = binance.fetch_ohlcv(symbol, "1h", limit=hours_elapsed)
+        if not hourly_data:
+            raise HTTPException(status_code=404, detail="No intraday data available")
+
+        # Filter candles to ensure they are within the current day (if necessary)
+        intraday = []
+        for candle in hourly_data:
+            candle_time = datetime.fromtimestamp(candle["timestamp"] / 1000, tz=timezone.utc)
+            if candle_time >= start_of_day:
+                intraday.append(candle)
+
+        return {
+            "symbol": symbol,
+            "intraday_data": intraday,
+            "time_updated": now.isoformat(),
+            "hours_elapsed": hours_elapsed,
+            "candles_returned": len(intraday)
+        }
+    except Exception as e:
+        logger.error(f"Intraday data error for {symbol}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Intraday data retrieval failed")
+
+
 @app.get("/predict/{symbol}", tags=["Predictions"])
 @limiter.limit("30/minute")
 async def predict_price(request: Request, symbol: str, interval: str = "1h"):
