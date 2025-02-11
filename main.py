@@ -14,6 +14,8 @@ import logging
 
 from data import BinanceClient, SYMBOLS_CACHE, TICKER_CACHE
 from models import predictor
+from services.gemini_insights import GeminiInsightsGenerator
+from services.metrics import MetricsTracker
 
 
 ALLOWED_INTERVALS = ["1h", "4h", "1d", "1w"]
@@ -26,7 +28,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("CryptoPredictAPI")
-
+metrics = MetricsTracker()
 binance = BinanceClient()
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(

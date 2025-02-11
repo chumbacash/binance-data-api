@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from typing import List, Dict
 import logging
 from services.gemini_insights import GeminiInsightsGenerator
+from functools import lru_cache
+import asyncio
+from cachetools import TTLCache
 
 logger = logging.getLogger("CryptoPredictAPI")
 
@@ -73,6 +76,7 @@ class TechnicalAnalyzer:
 class AdvancedPredictor:
     def __init__(self):
         self.gemini = GeminiInsightsGenerator()
+        self.analysis_cache = TTLCache(maxsize=500, ttl=300)  # Add prediction cache
         self.prices = []
         self.indicators = {
             "sma_20": None,
@@ -135,11 +139,15 @@ class AdvancedPredictor:
             "histogram": float(macd_line[-1] - signal)
         }
 
-    def analyze_market(self, prices: List[float], interval: str) -> Dict:
-        self.prices = prices
-        analyzer = TechnicalAnalyzer(prices)
-        
+    async def analyze_market(self, prices: List[float], interval: str) -> Dict:
+        cache_key = hash(tuple(prices[-100:]))  # Cache based on price pattern
+        if cache_key in self.analysis_cache:
+            return self.analysis_cache[cache_key]
+
         try:
+            self.prices = prices
+            analyzer = TechnicalAnalyzer(prices)
+            
             # First calculate all indicators
             self.indicators = {
                 "sma_20": self._calculate_sma(20),
@@ -154,8 +162,9 @@ class AdvancedPredictor:
             messages = analyzer.generate_messages(self.indicators)
             
             # Then get Gemini analysis
-            try:
-                gemini_analysis = self.gemini.generate_analysis({
+            gemini_analysis = await asyncio.to_thread(
+                self.gemini.generate_analysis,
+                {
                     "current_price": prices[-1],
                     "sma_20": self.indicators['sma_20'],
                     "sma_50": self.indicators['sma_50'],
@@ -163,11 +172,10 @@ class AdvancedPredictor:
                     "macd": self.indicators['macd'],
                     "volatility": self.indicators['volatility'],
                     "key_levels": self.indicators['key_levels']
-                })
-            except Exception as e:
-                gemini_analysis = {"error": "AI analysis unavailable"}
+                }
+            )
 
-            return {
+            result = {
                 "metadata": {
                     "symbol": "BTCUSDT",
                     "interval": interval,
@@ -183,6 +191,9 @@ class AdvancedPredictor:
                 "frontend_insights": messages,
                 "ai_insights": gemini_analysis
             }
+            
+            self.analysis_cache[cache_key] = result
+            return result
             
         except Exception as e:
             logger.error(f"Analysis error: {str(e)}")
