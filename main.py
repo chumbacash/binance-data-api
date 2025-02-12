@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import FastAPI, HTTPException, status, Request, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from datetime import datetime, timezone
 import os
 import asyncio
@@ -11,12 +11,11 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import logging
-
+from fastapi.staticfiles import StaticFiles
 from data import BinanceClient, SYMBOLS_CACHE, TICKER_CACHE
 from models import predictor
 from services.gemini_insights import GeminiInsightsGenerator
 from services.metrics import MetricsTracker
-
 
 ALLOWED_INTERVALS = ["1h", "4h", "1d", "1w"]
 INTERVAL_HOURS = {"1h": 1, "4h": 4, "1d": 24, "1w": 168}
@@ -27,12 +26,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("CryptoPredictAPI")
+logger = logging.getLogger("CoolifyCryptoAPI")
 metrics = MetricsTracker()
 binance = BinanceClient()
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
-    title="CryptoPredict Pro+",
+    title="Coolify CryptoPredict Pro+",
     description="Advanced Crypto Analytics & Predictions",
     version="0.3.0",
     docs_url="/docs",
@@ -49,6 +48,8 @@ app.add_middleware(
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 class LoggingMiddleware:
     async def __call__(self, request: Request, call_next):
@@ -56,6 +57,7 @@ class LoggingMiddleware:
         logger.info(f"{request.method} {request.url} - Status: {response.status_code}")
         return response
 app.middleware("http")(LoggingMiddleware())
+
 
 # Endpoints
 @app.get("/", tags=["Health"])
@@ -104,7 +106,8 @@ async def websocket_realtime(websocket: WebSocket, symbol: str):
     await websocket.accept()
     try:
         while True:
-            ohlcv = binance.fetch_ohlcv(symbol, "1h", limit=1)
+            # Await the async fetch_ohlcv call here
+            ohlcv = await binance.fetch_ohlcv(symbol, "1h", limit=1)
             if ohlcv:
                 await websocket.send_json({
                     "symbol": symbol,
@@ -115,8 +118,6 @@ async def websocket_realtime(websocket: WebSocket, symbol: str):
     except Exception as e:
         logger.error(f"WebSocket error ({symbol}): {str(e)}")
         await websocket.close(code=1011)
-
-
 
 @app.get("/intraday/{symbol}", tags=["Market Data"])
 @limiter.limit("30/minute")
@@ -132,8 +133,8 @@ async def get_intraday_data(request: Request, symbol: str):
         # Calculate how many full hours have elapsed since the start of the day (plus one to include the current hour)
         hours_elapsed = int((now - start_of_day).total_seconds() // 3600) + 1
 
-        # Fetch hourly OHLCV data for the symbol with limit = hours_elapsed
-        hourly_data = binance.fetch_ohlcv(symbol, "1h", limit=hours_elapsed)
+        # Await the async call for OHLCV data
+        hourly_data = await binance.fetch_ohlcv(symbol, "1h", limit=hours_elapsed)
         if not hourly_data:
             raise HTTPException(status_code=404, detail="No intraday data available")
 
@@ -155,12 +156,12 @@ async def get_intraday_data(request: Request, symbol: str):
         logger.error(f"Intraday data error for {symbol}: {str(e)}")
         raise HTTPException(status_code=500, detail="Intraday data retrieval failed")
 
-
 @app.get("/predict/{symbol}", tags=["Predictions"])
 @limiter.limit("30/minute")
 async def predict_price(request: Request, symbol: str, interval: str = "1h"):
     try:
-        ohlcv = binance.fetch_ohlcv(symbol, interval, limit=100)
+        # Await the async call for OHLCV data
+        ohlcv = await binance.fetch_ohlcv(symbol, interval, limit=100)
         closes = [entry["close"] for entry in ohlcv]
         
         if len(closes) < 50:
@@ -169,7 +170,8 @@ async def predict_price(request: Request, symbol: str, interval: str = "1h"):
                 detail="Need at least 50 data points for analysis"
             )
             
-        analysis = predictor.analyze_market(closes, interval)
+        # Await the async analyze_market call
+        analysis = await predictor.analyze_market(closes, interval)
         analysis["metadata"]["symbol"] = symbol
         
         return analysis
