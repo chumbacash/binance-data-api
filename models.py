@@ -140,6 +140,10 @@ class AdvancedPredictor:
         }
 
     async def analyze_market(self, prices: List[float], interval: str) -> Dict:
+        # Check if the prices seem normalized (e.g. max price < 100)
+        if max(prices) < 100:
+            prices = [p * 1000 for p in prices]
+        
         cache_key = hash(tuple(prices[-100:]))  # Cache based on price pattern
         if cache_key in self.analysis_cache:
             return self.analysis_cache[cache_key]
@@ -148,7 +152,7 @@ class AdvancedPredictor:
             self.prices = prices
             analyzer = TechnicalAnalyzer(prices)
             
-            # First calculate all indicators
+            # Calculate all indicators
             self.indicators = {
                 "sma_20": self._calculate_sma(20),
                 "sma_50": self._calculate_sma(50),
@@ -158,10 +162,8 @@ class AdvancedPredictor:
                 "key_levels": analyzer.find_key_levels()
             }
 
-            # Generate basic messages
             messages = analyzer.generate_messages(self.indicators)
             
-            # Then get Gemini analysis
             gemini_analysis = await asyncio.to_thread(
                 self.gemini.generate_analysis,
                 {
@@ -177,7 +179,7 @@ class AdvancedPredictor:
 
             result = {
                 "metadata": {
-                    "symbol": "BTCUSDT",
+                    "symbol": "BTCUSDT",  # This might need to be dynamic.
                     "interval": interval,
                     "last_updated": datetime.now(timezone.utc).isoformat(),
                     "data_quality": min(0.99, len(prices)/100)
@@ -201,6 +203,7 @@ class AdvancedPredictor:
                 status_code=500,
                 detail="Analysis failed: " + str(e)
             )
+
 
     def _generate_prediction(self) -> float:
         """Combine indicators for price prediction"""
