@@ -49,32 +49,57 @@ class TechnicalAnalyzer:
         return float(np.std(returns))
 
     def find_key_levels(self) -> Dict:
-        """Identify support/resistance using dynamic clustering"""
-        lookback = min(100, len(self.prices))
+        """Identify support/resistance using dynamic clustering with limited data handling"""
+        available_points = len(self.prices)
+        
+        # For very limited data, use simple percentage-based levels
+        if available_points < 10:
+            current_price = self.prices[-1]
+            recent_volatility = np.std(np.diff(self.prices)) / current_price
+            level_range = max(0.02, min(0.1, recent_volatility * 2))  # 2-10% range based on volatility
+            
+            return {
+                "support": float(current_price * (1 - level_range)),
+                "resistance": float(current_price * (1 + level_range)),
+                "trend_strength": 0.1  # Low trend strength for limited data
+            }
+        
+        # For limited but usable data, use adaptive percentiles
+        lookback = min(available_points, 100)
         prices = self.filtered_prices[-lookback:]
         
-        # Use smaller percentiles for limited data
-        percentile_range = (30, 70) if len(prices) >= 50 else (40, 60)
+        # Adjust percentile range based on available data
+        if available_points < 20:
+            percentile_range = (35, 65)  # Narrower range for very limited data
+        elif available_points < 50:
+            percentile_range = (30, 70)  # Wider range for more data
+        else:
+            percentile_range = (25, 75)  # Full range for sufficient data
         
         recent_highs = prices[prices >= np.percentile(prices, percentile_range[1])]
         recent_lows = prices[prices <= np.percentile(prices, percentile_range[0])]
         
-        # Calculate trend for support/resistance adjustment
+        # Calculate trend with available data
         trend = self._calculate_trend()
-        trend_adjustment = trend * np.std(prices) * 0.1
+        trend_adjustment = trend * np.std(prices) * 0.05  # Reduced adjustment for limited data
         
-        support = float(np.mean(recent_lows)) if len(recent_lows) > 0 else None
-        resistance = float(np.mean(recent_highs)) if len(recent_highs) > 0 else None
+        support = float(np.mean(recent_lows)) if len(recent_lows) > 0 else float(prices[-1] * 0.98)
+        resistance = float(np.mean(recent_highs)) if len(recent_highs) > 0 else float(prices[-1] * 1.02)
         
         if support:
             support += trend_adjustment
         if resistance:
             resistance += trend_adjustment
             
+        # Ensure support is below current price and resistance is above
+        current_price = float(prices[-1])
+        support = min(support, current_price * 0.99)
+        resistance = max(resistance, current_price * 1.01)
+            
         return {
             "support": support,
             "resistance": resistance,
-            "trend_strength": abs(trend)
+            "trend_strength": min(0.5, abs(trend))  # Limit trend strength for limited data
         }
 
     def _calculate_trend(self) -> float:
@@ -170,35 +195,57 @@ class AdvancedPredictor:
             window = max(5, len(self.prices) // 2)
         return float(np.mean(self.prices[-window:]))
 
-    def _calculate_adaptive_window(self, base_window: int) -> int:
-        """Calculate adaptive window size based on available data"""
-        return min(base_window, max(5, len(self.prices) // 3))
-
     def validate_data_length(window):
         def decorator(func):
             @wraps(func)
             def wrapper(self, *args, **kwargs):
-                actual_window = self._calculate_adaptive_window(window)
-                if len(self.prices) < actual_window:
-                    raise ValueError(f"Need at least {actual_window} price points")
-                return func(self, *args, actual_window=actual_window, **kwargs)
+                available_points = len(self.prices)
+                if available_points < 5:  # Absolute minimum required
+                    return func(self, *args, actual_window=5, **kwargs)
+                elif available_points < window:
+                    # For limited data, use what we have
+                    actual_window = max(5, available_points - 1)
+                else:
+                    # For sufficient data, use requested window
+                    actual_window = window
+                try:
+                    return func(self, *args, actual_window=actual_window, **kwargs)
+                except Exception as e:
+                    logger.warning(f"{func.__name__} calculation failed with window {actual_window}: {str(e)}")
+                    # Return safe defaults based on function
+                    if func.__name__ == '_calculate_rsi':
+                        return 50.0
+                    elif func.__name__ == '_calculate_macd':
+                        return {'macd_line': [0], 'signal_line': [0], 'histogram': [0]}
+                    return None
             return wrapper
         return decorator
 
+    def _calculate_adaptive_window(self, base_window: int) -> int:
+        """Calculate adaptive window size based on available data"""
+        available_points = len(self.prices)
+        if available_points < base_window:
+            return max(5, available_points - 1)  # Ensure we have at least 5 points
+        return base_window
+
     @validate_data_length(14)
     def _calculate_rsi(self, actual_window: int = 14) -> float:
-        """Calculate RSI with noise filtering"""
-        kf = KalmanFilter()
-        filtered_prices = np.array([kf.update(p) for p in self.prices[-actual_window-1:]])
-        deltas = np.diff(filtered_prices)
-        gains = deltas[deltas > 0]
-        losses = -deltas[deltas < 0]
-        
-        avg_gain = np.mean(gains) if len(gains) > 0 else 0
-        avg_loss = np.mean(losses) if len(losses) > 0 else 1e-6
-        
-        rs = avg_gain / avg_loss
-        return float(100 - (100 / (1 + rs)))
+        """Calculate RSI with noise filtering and limited data handling"""
+        try:
+            kf = KalmanFilter()
+            filtered_prices = np.array([kf.update(p) for p in self.prices[-actual_window-1:]])
+            deltas = np.diff(filtered_prices)
+            gains = deltas[deltas > 0]
+            losses = -deltas[deltas < 0]
+            
+            avg_gain = np.mean(gains) if len(gains) > 0 else 0
+            avg_loss = np.mean(losses) if len(losses) > 0 else 1e-6
+            
+            rs = avg_gain / avg_loss
+            return float(100 - (100 / (1 + rs)))
+        except Exception as e:
+            logger.error(f"RSI calculation failed: {str(e)}")
+            return 50.0  # Neutral RSI for limited data
 
     def _calculate_ema(self, window: int, prices: np.ndarray = None) -> np.ndarray:
         """Calculate EMA with Savitzky-Golay filtering for smoother results"""
@@ -309,7 +356,7 @@ class AdvancedPredictor:
         except (TypeError, ValueError):
             raise ValueError("Invalid price data format")
             
-        if len(prices) < 5:  # Minimum required data points
+        if len(prices) < 5:  # Absolute minimum required
             raise ValueError("Need at least 5 price points for analysis")
             
         if volumes is not None:
@@ -328,22 +375,31 @@ class AdvancedPredictor:
 
         try:
             analyzer = TechnicalAnalyzer(self.prices, self.volumes)
+            data_points = len(prices)
             
             # Calculate indicators with noise reduction and error handling
             self.indicators = {}
             
+            # Adaptive SMA calculations
             try:
-                self.indicators["sma_20"] = self._calculate_sma(20)
+                if data_points >= 20:
+                    self.indicators["sma_20"] = self._calculate_sma(20)
+                else:
+                    self.indicators["sma_20"] = float(prices[-1])
             except Exception as e:
                 logger.error(f"SMA-20 calculation failed: {str(e)}")
                 self.indicators["sma_20"] = float(prices[-1])
                 
             try:
-                self.indicators["sma_50"] = self._calculate_sma(50)
+                if data_points >= 50:
+                    self.indicators["sma_50"] = self._calculate_sma(50)
+                else:
+                    self.indicators["sma_50"] = float(prices[-1])
             except Exception as e:
                 logger.error(f"SMA-50 calculation failed: {str(e)}")
                 self.indicators["sma_50"] = float(prices[-1])
                 
+            # Calculate other indicators with adaptive windows
             try:
                 self.indicators["rsi"] = self._calculate_rsi()
             except Exception as e:
@@ -379,15 +435,18 @@ class AdvancedPredictor:
                 logger.error(f"Volume profile calculation failed: {str(e)}")
                 self.indicators["volume_profile"] = {"volume_trend": 0.0, "volume_signal": "neutral"}
 
+            # Generate insights with data quality awareness
             try:
                 messages = analyzer.generate_messages(self.indicators)
+                if data_points < 20:
+                    messages["summary"] = "Limited historical data available. Analysis may be less reliable."
             except Exception as e:
                 logger.error(f"Message generation failed: {str(e)}")
                 messages = {
-                    "summary": "Analysis available but insights generation failed",
+                    "summary": "Limited data available for comprehensive analysis",
                     "key_insights": [],
                     "action_guide": {"buy": 0.5, "sell": 0.5, "hold": 0.5},
-                    "confidence_factors": {"data_quality": 0.5, "trend_strength": 0, "volume_confidence": 0.5}
+                    "confidence_factors": {"data_quality": data_points/100, "trend_strength": 0, "volume_confidence": 0.5}
                 }
             
             # Get AI insights with confidence weighting
@@ -403,13 +462,19 @@ class AdvancedPredictor:
                 )
             except Exception as e:
                 logger.error(f"Gemini analysis failed: {str(e)}")
-                gemini_analysis = {"error": "AI analysis temporarily unavailable"}
+                gemini_analysis = {
+                    "market_summary": "Insufficient historical data for comprehensive AI analysis",
+                    "technical_observations": ["Limited price history available"],
+                    "trading_recommendations": ["Monitor for more data points"],
+                    "risk_factors": ["Limited historical context"]
+                }
 
             result = {
                 "metadata": {
                     "interval": interval,
                     "last_updated": datetime.now(timezone.utc).isoformat(),
-                    "data_quality": min(0.99, len(prices)/100),
+                    "data_points": data_points,
+                    "data_quality": min(0.99, data_points/100),
                     "confidence_score": self._calculate_confidence()
                 },
                 "price_analysis": {
@@ -433,105 +498,122 @@ class AdvancedPredictor:
             )
 
     def _generate_prediction(self) -> float:
-        """Generate price prediction using multiple factors"""
+        """Generate price prediction using weighted moving averages and trend"""
         try:
-            # Start with current price as base
-            current_price = self.prices[-1]
+            current_price = float(self.prices[-1])
+            available_points = len(self.prices)
             
-            # Calculate percentage changes for prediction
-            trend = self.indicators['key_levels']['trend_strength']
-            trend_impact = np.tanh(trend * 0.1)  # Normalized trend impact
+            # For very limited data, use simple trend-based prediction
+            if available_points < 10:
+                # Calculate simple momentum
+                price_change = (self.prices[-1] - self.prices[0]) / self.prices[0]
+                # Limit the change to ±1%
+                max_change = 0.01
+                change = np.clip(price_change, -max_change, max_change)
+                return round(current_price * (1 + change), 8 if current_price < 1 else 6 if current_price < 10 else 2)
             
-            # Apply MACD momentum as percentage
-            macd_hist = self.indicators['macd']['histogram'][-1]
-            macd_impact = np.tanh(macd_hist * 0.1)  # Normalized impact
+            # Calculate weighted average of recent prices
+            weights = np.linspace(1, 2, min(24, available_points))
+            weights = weights / np.sum(weights)  # Normalize weights
+            weighted_avg = np.sum(self.prices[-len(weights):] * weights)
             
-            # Apply RSI mean reversion as percentage
-            rsi_impact = np.tanh((50 - self.indicators['rsi']) * 0.02)  # Normalized RSI impact
+            # Calculate trend
+            short_term_change = (self.prices[-1] - self.prices[-min(5, available_points)]) / self.prices[-min(5, available_points)]
             
-            # Volume impact if available
-            volume_impact = 0
-            if self.indicators['volume_profile']['volume_signal'] != "neutral":
-                volume_impact = np.tanh(0.1 * self.indicators['volume_profile']['volume_trend'])
+            # Combine weighted average with trend
+            trend_impact = np.clip(short_term_change, -0.02, 0.02)  # Limit trend impact to ±2%
+            prediction = weighted_avg * (1 + trend_impact)
             
-            # Combine factors with data quality weighting
-            data_quality = min(1.0, len(self.prices) / 100)
-            total_impact = (trend_impact + macd_impact + rsi_impact + volume_impact) * data_quality
+            # Ensure prediction is within reasonable bounds (±3% of current price)
+            min_pred = current_price * 0.97
+            max_pred = current_price * 1.03
+            prediction = np.clip(prediction, min_pred, max_pred)
             
-            # Apply impact as percentage of current price (max 5% change)
-            prediction = current_price * (1 + np.clip(total_impact * 0.05, -0.05, 0.05))
-            
+            # Round based on price scale
             return round(float(prediction), 8 if current_price < 1 else 6 if current_price < 10 else 2)
+            
         except Exception as e:
-            logger.error(f"Prediction calculation error: {str(e)}")
+            logger.error(f"Simple prediction calculation error: {str(e)}")
             return self.prices[-1]  # Return current price as fallback
 
     def _calculate_prediction_range(self) -> Dict[str, float]:
-        """Calculate prediction range based on volatility and confidence"""
+        """Calculate prediction range based on recent price volatility"""
         try:
-            volatility = self.indicators['volatility']
-            confidence = self._calculate_confidence()
+            current_price = float(self.prices[-1])
+            available_points = len(self.prices)
+            
+            # For very limited data, use fixed percentage range
+            if available_points < 10:
+                range_multiplier = 0.02  # ±2% range
+            else:
+                # Calculate recent price changes
+                changes = np.diff(self.prices[-min(24, available_points):]) / self.prices[-min(24, available_points):-1]
+                # Use standard deviation of changes, with minimum and maximum bounds
+                range_multiplier = np.clip(np.std(changes) * 2, 0.01, 0.05)  # Between 1% and 5%
+            
             base_prediction = self._generate_prediction()
-            current_price = self.prices[-1]
             
-            # Wider range for lower confidence (max 10% range)
-            range_multiplier = np.clip(2 * (1 + (1 - confidence)) * volatility, 0.001, 0.1)
-            
-            # Calculate range as percentage of base prediction
+            # Calculate range
             range_low = base_prediction * (1 - range_multiplier)
             range_high = base_prediction * (1 + range_multiplier)
             
-            # Ensure correct ordering
-            if range_low > range_high:
-                range_low, range_high = range_high, range_low
-                
-            # Use appropriate decimal places based on price scale
+            # Round based on price scale
             decimals = 8 if current_price < 1 else 6 if current_price < 10 else 2
             return {
                 "low": round(float(range_low), decimals),
                 "high": round(float(range_high), decimals)
             }
+            
         except Exception as e:
             logger.error(f"Range calculation error: {str(e)}")
-            current_price = self.prices[-1]
-            # Fallback to ±0.5% of current price
+            current_price = float(self.prices[-1])
+            # Fallback to ±1% of current price
             decimals = 8 if current_price < 1 else 6 if current_price < 10 else 2
             return {
-                "low": round(float(current_price * 0.995), decimals),
-                "high": round(float(current_price * 1.005), decimals)
+                "low": round(float(current_price * 0.99), decimals),
+                "high": round(float(current_price * 1.01), decimals)
             }
 
     def _calculate_confidence(self) -> float:
-        """Calculate enhanced confidence score 0-1"""
+        """Calculate enhanced confidence score 0-1 with limited data handling"""
         if not self.indicators:
-            return 0.3
+            return 0.1  # Very low confidence for no indicators
             
-        confidence = 0.5
+        # Start with lower base confidence for limited data
+        data_points = len(self.prices)
+        if data_points < 20:
+            confidence = 0.2
+        elif data_points < 50:
+            confidence = 0.3
+        else:
+            confidence = 0.5
         
-        # Data quality impact
-        data_quality = min(1.0, len(self.prices) / 100)
-        confidence *= data_quality
+        # Data quality impact - more forgiving for new pairs
+        data_quality = min(1.0, len(self.prices) / 50)  # Reduced from 100 to 50 for faster quality gain
+        confidence *= (0.5 + 0.5 * data_quality)  # Less aggressive quality penalty
         
-        # Trend strength impact
-        trend_strength = self.indicators['key_levels']['trend_strength']
-        confidence += 0.1 * min(1.0, abs(trend_strength))
+        # Trend strength impact - reduced for limited data
+        trend_strength = abs(self.indicators['key_levels']['trend_strength'])
+        confidence += 0.05 * min(1.0, trend_strength)  # Reduced from 0.1 to 0.05
         
-        # Volatility impact (inverse)
-        confidence -= self.indicators['volatility'] * 0.5
+        # Volatility impact (inverse) - reduced for limited data
+        confidence -= self.indicators['volatility'] * 0.3  # Reduced from 0.5 to 0.3
         
-        # Volume confirmation if available
+        # Volume confirmation if available - reduced impact
         if self.indicators['volume_profile']['volume_signal'] != "neutral":
             volume_trend = abs(self.indicators['volume_profile']['volume_trend'])
-            confidence += 0.1 * min(1.0, volume_trend)
+            confidence += 0.05 * min(1.0, volume_trend)  # Reduced from 0.1 to 0.05
         
-        # Technical indicator agreement
-        if 30 < self.indicators['rsi'] < 70:
-            confidence += 0.1
+        # Technical indicator agreement - reduced thresholds for limited data
+        rsi_value = self.indicators['rsi']
+        if 25 < rsi_value < 75:  # Wider range for limited data
+            confidence += 0.05  # Reduced from 0.1 to 0.05
             
         macd_hist = self.indicators['macd']['histogram'][-1]
-        if abs(macd_hist) > 0:  # Strong MACD signal
-            confidence += 0.1
+        if abs(macd_hist) > 0:  # Any MACD signal
+            confidence += 0.05  # Reduced from 0.1 to 0.05
             
-        return max(0.3, min(0.95, confidence))
+        # Ensure minimum confidence for any prediction
+        return max(0.1, min(0.8, confidence))  # Reduced max confidence for limited data
 
 predictor = AdvancedPredictor()

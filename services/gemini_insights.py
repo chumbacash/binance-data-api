@@ -33,49 +33,94 @@ class GeminiInsightsGenerator:
             raise
 
     def generate_analysis(self, data: Dict) -> Dict:
-        """Generate market analysis using Gemini AI"""
+        """Generate market analysis using Gemini AI with asset-specific insights"""
         try:
-            # Format numbers for better readability
-            current_price = f"{data['current_price']:,.2f}"
-            sma_20 = f"{data['sma_20']:,.2f}"
-            sma_50 = f"{data['sma_50']:,.2f}"
-            volatility = f"{data['volatility']*100:.2f}%"
-            support = f"{data['key_levels']['support']:,.2f}"
-            resistance = f"{data['key_levels']['resistance']:,.2f}"
+            # Determine price scale and format numbers accordingly
+            current_price = data['current_price']
+            price_format = "{:,.8f}" if current_price < 0.01 else "{:,.6f}" if current_price < 1 else "{:,.2f}"
             
-            # Get trend direction
+            # Format numbers with appropriate decimal places
+            formatted_data = {
+                "price": price_format.format(current_price),
+                "sma_20": price_format.format(data['sma_20']),
+                "sma_50": price_format.format(data['sma_50']),
+                "support": price_format.format(data['key_levels']['support']),
+                "resistance": price_format.format(data['key_levels']['resistance'])
+            }
+            
+            # Get trend direction and strength
             trend = "bullish" if data['sma_20'] > data['sma_50'] else "bearish"
+            trend_strength = abs(data['key_levels']['trend_strength'])
+            trend_desc = "strong" if trend_strength > 0.5 else "moderate" if trend_strength > 0.2 else "weak"
             
-            prompt = f"""You are a professional cryptocurrency market analyst. Analyze these market indicators for trading insights:
+            # Calculate percentage changes for better context
+            sma20_change = ((data['sma_20'] - current_price) / current_price) * 100
+            sma50_change = ((data['sma_50'] - current_price) / current_price) * 100
 
-Current Market Data:
-- Price: ${current_price}
-- 20 SMA: ${sma_20}
-- 50 SMA: ${sma_50}
+            # Determine if this is a major pair
+            is_major_pair = (
+                current_price > 100  # High unit price
+                or "BTC" in data.get('symbol', '')  # Bitcoin pairs
+                or "ETH" in data.get('symbol', '')  # Ethereum pairs
+                or "USDT" in data.get('symbol', '')  # Major stablecoin pairs
+            )
+            
+            if is_major_pair:
+                prompt = f"""You are a professional cryptocurrency market analyst focusing on major cryptocurrency pairs. Analyze these market indicators for trading insights:
+
+Current Market Data for {data.get('symbol', 'Major Pair')}:
+- Current Price: ${formatted_data['price']}
+- 20 SMA: ${formatted_data['sma_20']} ({sma20_change:+.2f}% from current)
+- 50 SMA: ${formatted_data['sma_50']} ({sma50_change:+.2f}% from current)
 - RSI: {data['rsi']:.1f}
-- Trend: {trend.upper()}
-- Volatility: {volatility}
-- Support: ${support}
-- Resistance: ${resistance}
+- Trend: {trend_desc.upper()} {trend.upper()}
+- Volatility: {data['volatility']*100:.2f}%
+- Support: ${formatted_data['support']}
+- Resistance: ${formatted_data['resistance']}
 
 Provide a structured analysis in JSON format with:
 1. "summary": One clear sentence about the current market state
 2. "observations": List of 3 key technical observations
-3. "recommendations": List of 2 specific trading suggestions
-4. "risks": List of 2 potential risk factors
+3. "recommendations": List of 2 specific trading suggestions with clear entry/exit points
+4. "risks": List of 2 potential risk factors to monitor
 
-Focus on actionable insights and clear technical analysis. Keep it concise and professional.
-"""
+Focus on actionable insights and clear technical analysis. Keep it concise and professional."""
+            else:
+                prompt = f"""You are a professional cryptocurrency market analyst specializing in small-cap and micro-cap assets. Analyze these market indicators for trading insights:
 
-            # Generate with safety parameters
+Current Market Data for Small-Cap Asset {data.get('symbol', '')}:
+- Current Price: ${formatted_data['price']}
+- 20 SMA: ${formatted_data['sma_20']} ({sma20_change:+.2f}% from current)
+- 50 SMA: ${formatted_data['sma_50']} ({sma50_change:+.2f}% from current)
+- RSI: {data['rsi']:.1f}
+- Trend: {trend_desc.upper()} {trend.upper()}
+- Volatility: {data['volatility']*100:.2f}%
+- Support: ${formatted_data['support']}
+- Resistance: ${formatted_data['resistance']}
+
+Consider:
+1. This is a small-cap asset with potentially limited trading history
+2. Price movements may be more volatile than major pairs
+3. Lower liquidity may affect price action
+4. Technical indicators may be less reliable
+
+Provide a structured analysis in JSON format with:
+1. "summary": One clear sentence about the current market state, considering the asset's small-cap nature
+2. "observations": List of 3 key technical observations, focusing on reliable signals
+3. "recommendations": List of 2 specific trading suggestions, emphasizing risk management for small-cap assets
+4. "risks": List of 2 potential risk factors specific to small-cap trading
+
+Focus on practical insights while acknowledging the limitations of technical analysis for small-cap assets."""
+
+            # Generate with adjusted parameters based on asset type
             response = self.model.generate_content(
                 contents=[{
                     "parts": [{"text": prompt}]
                 }],
                 generation_config={
-                    "temperature": 0.7,
-                    "top_p": 0.8,
-                    "top_k": 40
+                    "temperature": 0.7 if is_major_pair else 0.6,  # More conservative for small caps
+                    "top_p": 0.8 if is_major_pair else 0.7,       # More focused for small caps
+                    "top_k": 40 if is_major_pair else 30          # More precise for small caps
                 },
                 request_options={"timeout": 15}
             )
