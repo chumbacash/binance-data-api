@@ -2,192 +2,420 @@
 import numpy as np
 from fastapi import HTTPException 
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import logging
 from services.gemini_insights import GeminiInsightsGenerator
-from functools import lru_cache
+from functools import lru_cache, wraps
 import asyncio
 from cachetools import TTLCache
+from scipy.stats import linregress
+from scipy.signal import savgol_filter
 
 logger = logging.getLogger("CryptoPredictAPI")
 
+class KalmanFilter:
+    def __init__(self, process_variance=1e-5, measurement_variance=0.1**2):
+        self.process_variance = process_variance
+        self.measurement_variance = measurement_variance
+        self.estimate = None
+        self.estimate_error = 1.0
+
+    def update(self, measurement):
+        if self.estimate is None:
+            self.estimate = measurement
+            return measurement
+
+        prediction = self.estimate
+        prediction_error = self.estimate_error + self.process_variance
+
+        kalman_gain = prediction_error / (prediction_error + self.measurement_variance)
+        self.estimate = prediction + kalman_gain * (measurement - prediction)
+        self.estimate_error = (1 - kalman_gain) * prediction_error
+
+        return self.estimate
+
 class TechnicalAnalyzer:
-    def __init__(self, prices: List[float]):
-        self.prices = prices
+    def __init__(self, prices: List[float], volumes: List[float] = None):
+        self.prices = np.array(prices)
+        self.volumes = np.array(volumes) if volumes is not None else None
+        self.kf = KalmanFilter()
+        self.filtered_prices = np.array([self.kf.update(p) for p in prices])
         
-    def calculate_volatility(self, window: int = 24) -> float:
-        """Calculate price volatility as standard deviation"""
-        returns = np.diff(self.prices[-window:]) / self.prices[-window:-1]
+    def calculate_volatility(self, window: int = None) -> float:
+        """Calculate adaptive volatility based on available data"""
+        if window is None:
+            window = min(24, len(self.prices) // 3)
+        returns = np.diff(self.filtered_prices[-window:]) / self.filtered_prices[-window:-1]
         return float(np.std(returns))
 
     def find_key_levels(self) -> Dict:
-        """Identify support/resistance using recent price extremes"""
+        """Identify support/resistance using dynamic clustering"""
         lookback = min(100, len(self.prices))
-        recent_highs = [h for h in self.prices[-lookback:] if h >= np.percentile(self.prices[-lookback:], 70)]
-        recent_lows = [l for l in self.prices[-lookback:] if l <= np.percentile(self.prices[-lookback:], 30)]
+        prices = self.filtered_prices[-lookback:]
+        
+        # Use smaller percentiles for limited data
+        percentile_range = (30, 70) if len(prices) >= 50 else (40, 60)
+        
+        recent_highs = prices[prices >= np.percentile(prices, percentile_range[1])]
+        recent_lows = prices[prices <= np.percentile(prices, percentile_range[0])]
+        
+        # Calculate trend for support/resistance adjustment
+        trend = self._calculate_trend()
+        trend_adjustment = trend * np.std(prices) * 0.1
+        
+        support = float(np.mean(recent_lows)) if len(recent_lows) > 0 else None
+        resistance = float(np.mean(recent_highs)) if len(recent_highs) > 0 else None
+        
+        if support:
+            support += trend_adjustment
+        if resistance:
+            resistance += trend_adjustment
+            
+        return {
+            "support": support,
+            "resistance": resistance,
+            "trend_strength": abs(trend)
+        }
+
+    def _calculate_trend(self) -> float:
+        """Calculate trend strength using linear regression"""
+        x = np.arange(len(self.filtered_prices))
+        slope, _, r_value, _, _ = linregress(x, self.filtered_prices)
+        return slope * r_value**2  # Weighted by R-squared
+
+    def calculate_volume_profile(self) -> Dict:
+        """Analyze volume profile if available"""
+        if self.volumes is None or len(self.volumes) < 2:
+            return {"volume_trend": 0, "volume_signal": "neutral"}
+            
+        recent_vol = np.mean(self.volumes[-5:])
+        older_vol = np.mean(self.volumes[-20:-5])
+        vol_change = (recent_vol - older_vol) / older_vol
         
         return {
-            "support": float(np.mean(recent_lows)) if recent_lows else None,
-            "resistance": float(np.mean(recent_highs)) if recent_highs else None
+            "volume_trend": float(vol_change),
+            "volume_signal": "increasing" if vol_change > 0.1 else "decreasing" if vol_change < -0.1 else "neutral"
         }
 
     def generate_messages(self, indicators: Dict) -> Dict:
-        """Create human-readable insights from technical data"""
+        """Create human-readable insights with confidence levels"""
         messages = {
             "summary": "",
             "key_insights": [],
-            "action_guide": {}
+            "action_guide": {},
+            "confidence_factors": {}
         }
 
-        # Trend analysis
-        if indicators['sma_20'] > indicators['sma_50']:
-            messages['key_insights'].append("Bullish SMA crossover (20 > 50)")
-        else:
-            messages['key_insights'].append("Bearish SMA crossover (20 < 50)")
+        # Dynamic trend analysis
+        trend_strength = abs(indicators.get('trend_strength', 0))
+        if trend_strength > 0.5:
+            confidence_mult = min(1.0, trend_strength)
+            if indicators['sma_20'] > indicators['sma_50']:
+                messages['key_insights'].append(f"Strong Bullish Trend (Confidence: {confidence_mult:.2f})")
+            else:
+                messages['key_insights'].append(f"Strong Bearish Trend (Confidence: {confidence_mult:.2f})")
 
-        # RSI analysis
-        if indicators['rsi'] > 70:
-            messages['key_insights'].append("Overbought (RSI > 70)")
-        elif indicators['rsi'] < 30:
-            messages['key_insights'].append("Oversold (RSI < 30)")
+        # RSI analysis with dynamic thresholds
+        rsi_thresholds = (30, 70) if len(self.prices) >= 50 else (20, 80)
+        if indicators['rsi'] > rsi_thresholds[1]:
+            messages['key_insights'].append(f"Overbought (RSI: {indicators['rsi']:.1f})")
+        elif indicators['rsi'] < rsi_thresholds[0]:
+            messages['key_insights'].append(f"Oversold (RSI: {indicators['rsi']:.1f})")
 
-        # MACD analysis
-        if indicators['macd']['histogram'] > 0:
-            messages['key_insights'].append("Bullish MACD momentum")
-        else:
-            messages['key_insights'].append("Bearish MACD momentum")
+        # Volume analysis if available
+        vol_profile = self.calculate_volume_profile()
+        if vol_profile['volume_signal'] != "neutral":
+            messages['key_insights'].append(f"Volume {vol_profile['volume_signal']} ({vol_profile['volume_trend']:.1%} change)")
 
-        # Generate summary
-        bull_count = sum(1 for insight in messages['key_insights'] if "Bullish" in insight)
-        bear_count = sum(1 for insight in messages['key_insights'] if "Bearish" in insight)
+        # Generate weighted action guide
+        bull_signals = sum(1 for insight in messages['key_insights'] if "Bullish" in insight or "Oversold" in insight)
+        bear_signals = sum(1 for insight in messages['key_insights'] if "Bearish" in insight or "Overbought" in insight)
         
-        if bull_count > bear_count:
-            messages['summary'] = "Bullish Bias Detected"
-            messages['action_guide'] = {"buy": 0.7, "sell": 0.3, "hold": 0.5}
-        elif bear_count > bull_count:
-            messages['summary'] = "Bearish Bias Detected"
-            messages['action_guide'] = {"buy": 0.3, "sell": 0.7, "hold": 0.4}
-        else:
-            messages['summary'] = "Neutral Market Conditions"
-            messages['action_guide'] = {"buy": 0.5, "sell": 0.5, "hold": 0.6}
+        # Weight signals by data quality
+        data_quality = min(1.0, len(self.prices) / 100)
+        signal_strength = (bull_signals - bear_signals) * data_quality
+        
+        messages['action_guide'] = {
+            "buy": max(0.3, min(0.7, 0.5 + signal_strength * 0.1)),
+            "sell": max(0.3, min(0.7, 0.5 - signal_strength * 0.1)),
+            "hold": 0.5 + (0.1 if abs(signal_strength) < 0.2 else 0)
+        }
+        
+        messages['confidence_factors'] = {
+            "data_quality": data_quality,
+            "trend_strength": trend_strength,
+            "volume_confidence": 0.5 + abs(vol_profile['volume_trend'])
+        }
 
         return messages
 
 class AdvancedPredictor:
     def __init__(self):
         self.gemini = GeminiInsightsGenerator()
-        self.analysis_cache = TTLCache(maxsize=500, ttl=300)  # Add prediction cache
+        self.analysis_cache = TTLCache(maxsize=500, ttl=300)
         self.prices = []
+        self.volumes = []
         self.indicators = {
             "sma_20": None,
             "sma_50": None,
             "rsi": None,
-            "macd": {}
+            "macd": {},
+            "trend": None,
+            "volume_profile": None
         }
         
     def _calculate_sma(self, window: int) -> float:
+        """Calculate SMA with dynamic window size for limited data"""
+        if len(self.prices) < window:
+            window = max(5, len(self.prices) // 2)
         return float(np.mean(self.prices[-window:]))
 
-    def _calculate_rsi(self, window: int = 14) -> float:
-        deltas = np.diff(self.prices)
-        gains = np.where(deltas > 0, deltas, 0)
-        losses = np.where(deltas < 0, -deltas, 0)
+    def _calculate_adaptive_window(self, base_window: int) -> int:
+        """Calculate adaptive window size based on available data"""
+        return min(base_window, max(5, len(self.prices) // 3))
+
+    def validate_data_length(window):
+        def decorator(func):
+            @wraps(func)
+            def wrapper(self, *args, **kwargs):
+                actual_window = self._calculate_adaptive_window(window)
+                if len(self.prices) < actual_window:
+                    raise ValueError(f"Need at least {actual_window} price points")
+                return func(self, *args, actual_window=actual_window, **kwargs)
+            return wrapper
+        return decorator
+
+    @validate_data_length(14)
+    def _calculate_rsi(self, actual_window: int = 14) -> float:
+        """Calculate RSI with noise filtering"""
+        kf = KalmanFilter()
+        filtered_prices = np.array([kf.update(p) for p in self.prices[-actual_window-1:]])
+        deltas = np.diff(filtered_prices)
+        gains = deltas[deltas > 0]
+        losses = -deltas[deltas < 0]
         
-        avg_gain = np.mean(gains[-window:])
-        avg_loss = np.mean(losses[-window:])
+        avg_gain = np.mean(gains) if len(gains) > 0 else 0
+        avg_loss = np.mean(losses) if len(losses) > 0 else 1e-6
         
-        if avg_loss == 0:
-            return 100.0
         rs = avg_gain / avg_loss
         return float(100 - (100 / (1 + rs)))
 
     def _calculate_ema(self, window: int, prices: np.ndarray = None) -> np.ndarray:
-        prices = np.array(prices) if prices is not None else np.array(self.prices)
-        if len(prices) < window:
+        """Calculate EMA with Savitzky-Golay filtering for smoother results"""
+        # Input validation
+        if prices is None:
+            prices = self.prices
+        if not isinstance(prices, np.ndarray):
+            prices = np.array(prices, dtype=float)
+        if len(prices) == 0:
             return np.array([])
-        weights = np.exp(np.linspace(-1., 0., window))
-        weights /= weights.sum()
-        return np.convolve(prices, weights, mode='valid')
-
-    def _calculate_macd(self) -> Dict:
-        # Calculate EMAs as numpy arrays
-        ema12 = self._calculate_ema(12)
-        ema26 = self._calculate_ema(26)
-        
-        # Handle insufficient data
-        if len(ema12) == 0 or len(ema26) == 0:
-            return {"macd": 0.0, "signal": 0.0, "histogram": 0.0}
-        
-        # Align lengths
-        min_len = min(len(ema12), len(ema26))
-        ema12 = ema12[-min_len:]
-        ema26 = ema26[-min_len:]
-        
-        # Calculate MACD line
-        macd_line = ema12 - ema26
-        
-        # Calculate signal line
-        if len(macd_line) >= 9:
-            signal_line = self._calculate_ema(9, macd_line)
-            signal = signal_line[-1] if len(signal_line) > 0 else 0.0
-        else:
-            signal = 0.0
             
-        return {
-            "macd": float(macd_line[-1]),
-            "signal": float(signal),
-            "histogram": float(macd_line[-1] - signal)
-        }
-
-    async def analyze_market(self, prices: List[float], interval: str) -> Dict:
-        # Check if the prices seem normalized (e.g. max price < 100)
-        if max(prices) < 100:
-            prices = [p * 1000 for p in prices]
+        # Ensure minimum window size
+        if len(prices) < window:
+            window = max(2, len(prices) // 2)
+            
+        # Apply Savitzky-Golay filter for noise reduction
+        window_length = min(7, len(prices) - 1 if len(prices) % 2 == 0 else len(prices))
+        if window_length > 2:
+            try:
+                prices = savgol_filter(prices, window_length, 3)
+            except Exception as e:
+                logger.warning(f"Savitzky-Golay filtering failed, using raw prices: {str(e)}")
+            
+        # Calculate EMA
+        alpha = 2 / (window + 1)
+        ema = np.zeros_like(prices)
+        ema[0] = prices[0]
         
-        cache_key = hash(tuple(prices[-100:]))  # Cache based on price pattern
+        for i in range(1, len(prices)):
+            ema[i] = alpha * prices[i] + (1 - alpha) * ema[i-1]
+            
+        return ema
+
+    @validate_data_length(26)
+    def _calculate_macd(self, actual_window: int = 26) -> dict:
+        """Calculate MACD with adaptive windows"""
+        try:
+            # Input validation
+            if not isinstance(self.prices, (list, np.ndarray)) or len(self.prices) == 0:
+                return {'macd_line': [0], 'signal_line': [0], 'histogram': [0]}
+
+            prices = np.array(self.prices, dtype=float)
+            
+            # Ensure we have enough data
+            min_required = actual_window + 10  # Add buffer for signal line
+            if len(prices) < min_required:
+                actual_window = max(10, len(prices) // 3)
+            
+            short_window = max(5, actual_window // 2)
+            long_window = actual_window
+            signal_window = max(3, actual_window // 3)
+            
+            # Calculate EMAs
+            ema_short = self._calculate_ema(short_window, prices)
+            ema_long = self._calculate_ema(long_window, prices)
+            
+            # Ensure we have valid data
+            if len(ema_short) == 0 or len(ema_long) == 0:
+                return {'macd_line': [0], 'signal_line': [0], 'histogram': [0]}
+            
+            # Align the arrays by trimming from the end
+            min_len = min(len(ema_short), len(ema_long))
+            macd_line = ema_short[-min_len:] - ema_long[-min_len:]
+            
+            # Calculate signal line
+            signal_line = self._calculate_ema(signal_window, macd_line)
+            
+            # Ensure arrays are of equal length for histogram calculation
+            min_len = min(len(macd_line), len(signal_line))
+            if min_len == 0:
+                return {'macd_line': [0], 'signal_line': [0], 'histogram': [0]}
+                
+            macd_line = macd_line[-min_len:]
+            signal_line = signal_line[-min_len:]
+            histogram = macd_line - signal_line
+            
+            return {
+                'macd_line': macd_line.tolist(),
+                'signal_line': signal_line.tolist(),
+                'histogram': histogram.tolist()
+            }
+            
+        except Exception as e:
+            logger.error(f"MACD calculation error: {str(e)}")
+            return {'macd_line': [0], 'signal_line': [0], 'histogram': [0]}
+
+    def handle_analysis_errors(func):
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            try:
+                return await func(self, *args, **kwargs)
+            except ValueError as e:
+                logging.error(f"Validation error: {str(e)}")
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                logging.error(f"Analysis error: {str(e)}")
+                raise HTTPException(status_code=500, detail="Internal analysis error")
+        return wrapper
+
+    @handle_analysis_errors
+    async def analyze_market(self, prices: List[float], volumes: List[float] = None, interval: str = "1h") -> Dict:
+        # Input validation
+        if not prices:
+            raise ValueError("No price data provided")
+            
+        try:
+            prices = [float(p) for p in prices]  # Ensure all prices are float
+        except (TypeError, ValueError):
+            raise ValueError("Invalid price data format")
+            
+        if len(prices) < 5:  # Minimum required data points
+            raise ValueError("Need at least 5 price points for analysis")
+            
+        if volumes is not None:
+            try:
+                volumes = [float(v) for v in volumes]  # Ensure all volumes are float
+            except (TypeError, ValueError):
+                volumes = None  # Reset to None if invalid
+                
+        # Remove price normalization - work with actual prices
+        self.prices = np.array(prices, dtype=float)
+        self.volumes = np.array(volumes, dtype=float) if volumes is not None else None
+        
+        cache_key = hash(tuple(prices[-100:]))
         if cache_key in self.analysis_cache:
             return self.analysis_cache[cache_key]
 
         try:
-            self.prices = prices
-            analyzer = TechnicalAnalyzer(prices)
+            analyzer = TechnicalAnalyzer(self.prices, self.volumes)
             
-            # Calculate all indicators
-            self.indicators = {
-                "sma_20": self._calculate_sma(20),
-                "sma_50": self._calculate_sma(50),
-                "rsi": self._calculate_rsi(),
-                "macd": self._calculate_macd(),
-                "volatility": analyzer.calculate_volatility(),
-                "key_levels": analyzer.find_key_levels()
-            }
-
-            messages = analyzer.generate_messages(self.indicators)
+            # Calculate indicators with noise reduction and error handling
+            self.indicators = {}
             
-            gemini_analysis = await asyncio.to_thread(
-                self.gemini.generate_analysis,
-                {
-                    "current_price": prices[-1],
-                    "sma_20": self.indicators['sma_20'],
-                    "sma_50": self.indicators['sma_50'],
-                    "rsi": self.indicators['rsi'],
-                    "macd": self.indicators['macd'],
-                    "volatility": self.indicators['volatility'],
-                    "key_levels": self.indicators['key_levels']
+            try:
+                self.indicators["sma_20"] = self._calculate_sma(20)
+            except Exception as e:
+                logger.error(f"SMA-20 calculation failed: {str(e)}")
+                self.indicators["sma_20"] = float(prices[-1])
+                
+            try:
+                self.indicators["sma_50"] = self._calculate_sma(50)
+            except Exception as e:
+                logger.error(f"SMA-50 calculation failed: {str(e)}")
+                self.indicators["sma_50"] = float(prices[-1])
+                
+            try:
+                self.indicators["rsi"] = self._calculate_rsi()
+            except Exception as e:
+                logger.error(f"RSI calculation failed: {str(e)}")
+                self.indicators["rsi"] = 50.0
+                
+            try:
+                self.indicators["macd"] = self._calculate_macd()
+            except Exception as e:
+                logger.error(f"MACD calculation failed: {str(e)}")
+                self.indicators["macd"] = {'macd_line': [0], 'signal_line': [0], 'histogram': [0]}
+                
+            try:
+                self.indicators["volatility"] = float(analyzer.calculate_volatility())
+            except Exception as e:
+                logger.error(f"Volatility calculation failed: {str(e)}")
+                self.indicators["volatility"] = 0.01
+                
+            try:
+                self.indicators["key_levels"] = analyzer.find_key_levels()
+            except Exception as e:
+                logger.error(f"Key levels calculation failed: {str(e)}")
+                current_price = float(prices[-1])
+                self.indicators["key_levels"] = {
+                    "support": current_price * 0.95,
+                    "resistance": current_price * 1.05,
+                    "trend_strength": 0.0
                 }
-            )
+                
+            try:
+                self.indicators["volume_profile"] = analyzer.calculate_volume_profile()
+            except Exception as e:
+                logger.error(f"Volume profile calculation failed: {str(e)}")
+                self.indicators["volume_profile"] = {"volume_trend": 0.0, "volume_signal": "neutral"}
+
+            try:
+                messages = analyzer.generate_messages(self.indicators)
+            except Exception as e:
+                logger.error(f"Message generation failed: {str(e)}")
+                messages = {
+                    "summary": "Analysis available but insights generation failed",
+                    "key_insights": [],
+                    "action_guide": {"buy": 0.5, "sell": 0.5, "hold": 0.5},
+                    "confidence_factors": {"data_quality": 0.5, "trend_strength": 0, "volume_confidence": 0.5}
+                }
+            
+            # Get AI insights with confidence weighting
+            try:
+                gemini_analysis = await asyncio.to_thread(
+                    self.gemini.generate_analysis,
+                    {
+                        "current_price": float(prices[-1]),
+                        **self.indicators,
+                        "data_quality": min(0.99, len(prices)/100),
+                        "interval": interval
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Gemini analysis failed: {str(e)}")
+                gemini_analysis = {"error": "AI analysis temporarily unavailable"}
 
             result = {
                 "metadata": {
-                    "symbol": "BTCUSDT",  # This might need to be dynamic.
                     "interval": interval,
                     "last_updated": datetime.now(timezone.utc).isoformat(),
-                    "data_quality": min(0.99, len(prices)/100)
+                    "data_quality": min(0.99, len(prices)/100),
+                    "confidence_score": self._calculate_confidence()
                 },
                 "price_analysis": {
-                    "current": prices[-1],
+                    "current": float(prices[-1]),
                     "prediction": self._generate_prediction(),
-                    "confidence": self._calculate_confidence(),
+                    "prediction_range": self._calculate_prediction_range(),
                     **self.indicators
                 },
                 "frontend_insights": messages,
@@ -201,39 +429,109 @@ class AdvancedPredictor:
             logger.error(f"Analysis error: {str(e)}")
             raise HTTPException(
                 status_code=500,
-                detail="Analysis failed: " + str(e)
+                detail=f"Analysis failed: {str(e)}"
             )
 
-
     def _generate_prediction(self) -> float:
-        """Combine indicators for price prediction"""
-        base_price = self.indicators['sma_20']
-        
-        # MACD influence
-        if self.indicators['macd']['histogram'] > 0:
-            base_price *= 1.005
-        else:
-            base_price *= 0.995
+        """Generate price prediction using multiple factors"""
+        try:
+            # Start with current price as base
+            current_price = self.prices[-1]
             
-        # RSI influence
-        if self.indicators['rsi'] > 70:
-            base_price *= 0.99
-        elif self.indicators['rsi'] < 30:
-            base_price *= 1.01
+            # Calculate percentage changes for prediction
+            trend = self.indicators['key_levels']['trend_strength']
+            trend_impact = np.tanh(trend * 0.1)  # Normalized trend impact
             
-        return round(float(base_price), 2)
+            # Apply MACD momentum as percentage
+            macd_hist = self.indicators['macd']['histogram'][-1]
+            macd_impact = np.tanh(macd_hist * 0.1)  # Normalized impact
+            
+            # Apply RSI mean reversion as percentage
+            rsi_impact = np.tanh((50 - self.indicators['rsi']) * 0.02)  # Normalized RSI impact
+            
+            # Volume impact if available
+            volume_impact = 0
+            if self.indicators['volume_profile']['volume_signal'] != "neutral":
+                volume_impact = np.tanh(0.1 * self.indicators['volume_profile']['volume_trend'])
+            
+            # Combine factors with data quality weighting
+            data_quality = min(1.0, len(self.prices) / 100)
+            total_impact = (trend_impact + macd_impact + rsi_impact + volume_impact) * data_quality
+            
+            # Apply impact as percentage of current price (max 5% change)
+            prediction = current_price * (1 + np.clip(total_impact * 0.05, -0.05, 0.05))
+            
+            return round(float(prediction), 8 if current_price < 1 else 6 if current_price < 10 else 2)
+        except Exception as e:
+            logger.error(f"Prediction calculation error: {str(e)}")
+            return self.prices[-1]  # Return current price as fallback
+
+    def _calculate_prediction_range(self) -> Dict[str, float]:
+        """Calculate prediction range based on volatility and confidence"""
+        try:
+            volatility = self.indicators['volatility']
+            confidence = self._calculate_confidence()
+            base_prediction = self._generate_prediction()
+            current_price = self.prices[-1]
+            
+            # Wider range for lower confidence (max 10% range)
+            range_multiplier = np.clip(2 * (1 + (1 - confidence)) * volatility, 0.001, 0.1)
+            
+            # Calculate range as percentage of base prediction
+            range_low = base_prediction * (1 - range_multiplier)
+            range_high = base_prediction * (1 + range_multiplier)
+            
+            # Ensure correct ordering
+            if range_low > range_high:
+                range_low, range_high = range_high, range_low
+                
+            # Use appropriate decimal places based on price scale
+            decimals = 8 if current_price < 1 else 6 if current_price < 10 else 2
+            return {
+                "low": round(float(range_low), decimals),
+                "high": round(float(range_high), decimals)
+            }
+        except Exception as e:
+            logger.error(f"Range calculation error: {str(e)}")
+            current_price = self.prices[-1]
+            # Fallback to ±0.5% of current price
+            decimals = 8 if current_price < 1 else 6 if current_price < 10 else 2
+            return {
+                "low": round(float(current_price * 0.995), decimals),
+                "high": round(float(current_price * 1.005), decimals)
+            }
 
     def _calculate_confidence(self) -> float:
-        """Calculate confidence score 0-1"""
+        """Calculate enhanced confidence score 0-1"""
+        if not self.indicators:
+            return 0.3
+            
         confidence = 0.5
-        # Volatility impact
+        
+        # Data quality impact
+        data_quality = min(1.0, len(self.prices) / 100)
+        confidence *= data_quality
+        
+        # Trend strength impact
+        trend_strength = self.indicators['key_levels']['trend_strength']
+        confidence += 0.1 * min(1.0, abs(trend_strength))
+        
+        # Volatility impact (inverse)
         confidence -= self.indicators['volatility'] * 0.5
-        # SMA crossover confirmation
-        if self.indicators['sma_20'] > self.indicators['sma_50']:
-            confidence += 0.2
-        # RSI confirmation
+        
+        # Volume confirmation if available
+        if self.indicators['volume_profile']['volume_signal'] != "neutral":
+            volume_trend = abs(self.indicators['volume_profile']['volume_trend'])
+            confidence += 0.1 * min(1.0, volume_trend)
+        
+        # Technical indicator agreement
         if 30 < self.indicators['rsi'] < 70:
             confidence += 0.1
-        return max(0.3, min(0.99, confidence))
+            
+        macd_hist = self.indicators['macd']['histogram'][-1]
+        if abs(macd_hist) > 0:  # Strong MACD signal
+            confidence += 0.1
+            
+        return max(0.3, min(0.95, confidence))
 
 predictor = AdvancedPredictor()
