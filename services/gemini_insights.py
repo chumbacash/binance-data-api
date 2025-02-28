@@ -21,7 +21,7 @@ class GeminiInsightsGenerator:
             
         try:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-2.0-flash')
+            self.model = genai.GenerativeModel('gemini-1.5-pro')
             
             # Test the API connection
             response = self.model.generate_content("Test connection")

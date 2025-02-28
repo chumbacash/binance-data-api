@@ -6,14 +6,13 @@ charset-normalizer==3.4.1
 click==8.1.8
 colorama==0.4.6
 Deprecated==1.2.17
-fastapi==0.115.7
+fastapi  # Latest version
 google-ai-generativelanguage==0.6.15
 google-api-core==2.24.1
 google-api-python-client==2.160.0
 google-auth==2.38.0
 google-auth-httplib2==0.2.0
-google-genai==1.0.0
-google-generativeai==1.1.0
+google-generativeai==0.8.4  # Corrected to a valid version
 googleapis-common-protos==1.67.0rc1
 grpcio==1.70.0
 grpcio-status==1.70.0
@@ -42,7 +41,7 @@ scipy
 six==1.17.0
 slowapi==0.1.9
 sniffio==1.3.1
-starlette==0.45.3
+starlette  # Let pip resolve the version compatible with fastapi
 ta==0.11.0
 tenacity==9.0.0
 threadpoolctl==3.5.0
