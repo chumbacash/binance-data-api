@@ -218,13 +218,42 @@
         <!-- Try It Now Section -->
         <section class="bg-gray-800 rounded-lg p-8 mb-12">
             <h2 class="text-2xl font-bold mb-4">Try It Now</h2>
-            <div class="bg-gray-900 p-4 rounded-lg font-mono text-sm mb-4 overflow-x-auto">
-                <pre><code>curl "http://localhost:8000/predict/BTCUSDT?interval=4h"</code></pre>
+            <div class="relative bg-gray-900 p-4 rounded-lg font-mono text-sm mb-4 overflow-x-auto">
+                <pre id="curlCommand"><code>curl "https://api-crypto.coolifyapp.com/predict/BTCUSDT?interval=4h"</code></pre>
+                <button onclick="copyToClipboard()" class="absolute top-2 right-2 bg-gray-700 hover:bg-gray-600 text-white px-2 py-1 rounded text-xs">
+                    Copy
+                </button>
             </div>
-            <p class="text-gray-400 mb-4">Get a prediction for Bitcoin with 4-hour interval data.</p>
-            <a href="/docs" class="bg-primary-700 hover:bg-primary-600 text-white px-4 py-2 rounded-lg inline-block transition-colors">
-                Explore More Examples
-            </a>
+            <p class="text-gray-400 mb-4">Get a prediction for Bitcoin with 4-hour interval data. Try it yourself!</p>
+            <div class="flex flex-wrap gap-3">
+                <a href="/docs" class="bg-primary-700 hover:bg-primary-600 text-white px-4 py-2 rounded-lg inline-block transition-colors">
+                    Explore More Examples
+                </a>
+                <button onclick="copyToClipboard()" class="bg-crypto-binance hover:bg-yellow-500 text-gray-900 font-bold px-4 py-2 rounded-lg transition-colors">
+                    Copy & Try Now
+                </button>
+            </div>
+            
+            <script>
+                function copyToClipboard() {
+                    const commandText = document.getElementById('curlCommand').textContent;
+                    navigator.clipboard.writeText(commandText)
+                        .then(() => {
+                            // Show a temporary success message
+                            const buttons = document.querySelectorAll('button');
+                            buttons.forEach(button => {
+                                const originalText = button.textContent;
+                                button.textContent = 'Copied!';
+                                setTimeout(() => {
+                                    button.textContent = originalText;
+                                }, 1500);
+                            });
+                        })
+                        .catch(err => {
+                            console.error('Failed to copy: ', err);
+                        });
+                }
+            </script>
         </section>
 
         <!-- Footer -->
