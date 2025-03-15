@@ -63,7 +63,19 @@ crypto-data/
 |-------------------|--------|---------------------------------|--------------|
 | `/predict/{symbol}` | GET    | Price prediction + AI analysis  | 10/min       |
 | `/symbols`        | GET    | Active trading pairs            | 30/min       |
-| `/ws/realtime`    | WS     | Real-time price streaming       | -            |
+| `/intraday/{symbol}` | GET  | Intraday data with custom intervals | 30/min   |
+| `/historical/{symbol}` | GET | Historical data with custom intervals | 20/min |
+| `/ws/realtime/{symbol}` | WS | Real-time price streaming with custom intervals | - |
+
+## Supported Timeframes ⏰
+The API supports the following timeframes for data retrieval and analysis:
+
+- **Hours**: 1h, 2h, 4h, 6h, 8h, 12h
+- **Days**: 1d, 3d
+- **Weeks**: 1w
+- **Months**: 1M
+
+Use these interval values with the `/predict`, `/intraday`, and `/historical` endpoints.
 
 ## Rate Limits ⏱️
 - Global limit: 100 requests/hour
@@ -95,11 +107,17 @@ pytest tests/ -v
 
 ## Testing 🔍
 ```bash
-# Get BTC prediction
+# Get BTC prediction with 1-hour interval
 curl "http://localhost:8000/predict/BTCUSDT?interval=1h"
 
-# Stream real-time data
-wscat -c ws://localhost:8000/ws/realtime/BTCUSDT
+# Get historical data with 4-hour interval
+curl "http://localhost:8000/historical/BTCUSDT?interval=4h&limit=50"
+
+# Get intraday data with 1-hour interval
+curl "http://localhost:8000/intraday/BTCUSDT?interval=1h"
+
+# Stream real-time data with 1-hour interval
+wscat -c "ws://localhost:8000/ws/realtime/BTCUSDT?interval=1h"
 ```
 
 ## License 📄

@@ -177,7 +177,8 @@ class TechnicalAnalyzer:
 class AdvancedPredictor:
     def __init__(self):
         self.gemini = GeminiInsightsGenerator()
-        self.analysis_cache = TTLCache(maxsize=500, ttl=300)
+        # Reduce TTL to 60 seconds to ensure more frequent refreshes
+        self.analysis_cache = TTLCache(maxsize=500, ttl=60)
         self.prices = []
         self.volumes = []
         self.indicators = {
@@ -188,6 +189,23 @@ class AdvancedPredictor:
             "trend": None,
             "volume_profile": None
         }
+        # Schedule cache clearing
+        self._schedule_cache_clear()
+        
+    def _schedule_cache_clear(self):
+        """Schedule periodic cache clearing"""
+        try:
+            asyncio.create_task(self._clear_cache_periodically())
+        except RuntimeError:
+            # If we're not in an event loop, just clear the cache now
+            self.analysis_cache.clear()
+            
+    async def _clear_cache_periodically(self):
+        """Clear the cache every 5 minutes"""
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            self.analysis_cache.clear()
+            logger.info("Analysis cache cleared")
         
     def _calculate_sma(self, window: int) -> float:
         """Calculate SMA with dynamic window size for limited data"""
@@ -347,6 +365,14 @@ class AdvancedPredictor:
 
     @handle_analysis_errors
     async def analyze_market(self, prices: List[float], volumes: List[float] = None, interval: str = "1h") -> Dict:
+        # Debug logging for interval
+        logger.info(f"Analyzing market with interval: {interval}")
+        
+        # Ensure interval is not None or empty
+        if not interval:
+            logger.warning("Interval was empty or None, defaulting to 1h")
+            interval = "1h"
+        
         # Input validation
         if not prices:
             raise ValueError("No price data provided")
@@ -369,10 +395,18 @@ class AdvancedPredictor:
         self.prices = np.array(prices, dtype=float)
         self.volumes = np.array(volumes, dtype=float) if volumes is not None else None
         
-        cache_key = hash(tuple(prices[-100:]))
+        # Create a more robust cache key that includes the interval
+        # Use a string representation to ensure the interval is properly included
+        cache_key = f"{hash(tuple(prices[-100:]))}__{interval}"
+        
+        # Check if we have a cached result
         if cache_key in self.analysis_cache:
-            return self.analysis_cache[cache_key]
-
+            cached_result = self.analysis_cache[cache_key]
+            # Verify the interval in the cached result matches the requested interval
+            if cached_result.get("metadata", {}).get("interval") == interval:
+                return cached_result
+            # If intervals don't match, continue with analysis (cache bypass)
+        
         try:
             analyzer = TechnicalAnalyzer(self.prices, self.volumes)
             data_points = len(prices)
@@ -486,6 +520,9 @@ class AdvancedPredictor:
                 "frontend_insights": messages,
                 "ai_insights": gemini_analysis
             }
+            
+            # Log the interval being used in the result
+            logger.info(f"Analysis completed with interval: {interval}, result interval: {result['metadata']['interval']}")
             
             self.analysis_cache[cache_key] = result
             return result
