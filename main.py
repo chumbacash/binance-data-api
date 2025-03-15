@@ -12,6 +12,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import logging
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.responses import HTMLResponse
 from data import BinanceClient, SYMBOLS_CACHE, TICKER_CACHE
 from models import predictor
 from services.gemini_insights import GeminiInsightsGenerator
@@ -61,6 +63,8 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# Templates
+templates = Jinja2Templates(directory="templates")
 
 class LoggingMiddleware:
     async def __call__(self, request: Request, call_next):
@@ -71,9 +75,21 @@ app.middleware("http")(LoggingMiddleware())
 
 
 # Endpoints
-@app.get("/", tags=["Health"])
-@limiter.limit("100/minute")
+@app.get("/", response_class=HTMLResponse, tags=["UI"])
 async def root(request: Request):
+    return templates.TemplateResponse(
+        "index.html", 
+        {
+            "request": request,
+            "app_name": "CryptoPredict Pro+",
+            "version": "0.3.0",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    )
+
+@app.get("/api/health", tags=["Health"])
+@limiter.limit("100/minute")
+async def health_check(request: Request):
     return {
         "name": "CryptoPredict Pro+",
         "status": "online",
